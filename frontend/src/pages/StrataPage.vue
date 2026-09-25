@@ -12,6 +12,7 @@ import { trenchStore } from '@/stores/trenchStore'
 import { artifactStore } from '@/stores/artifactStore'
 import { relationStore } from '@/stores/relationStore'
 import { uid } from '@/utils/id'
+import { planStratumMerge } from '@/utils/merge'
 
 const trenchState = useStore(trenchStore)
 const stratumState = useStore(stratumStore)
@@ -193,6 +194,99 @@ async function applyBatchType(): Promise<void> {
   await stratumStore.getState().bulkSetType(selectedIds.value, batchType.value)
   ElMessage.success(`已把 ${selectedIds.value.length} 个单位的类型调整为「${batchType.value}」`)
 }
+
+/* ---------- 合并地层单位 ---------- */
+
+const mergeVisible = ref(false)
+const merging = ref(false)
+const mergeTrenchId = ref('')
+const mergeKeepId = ref('')
+const mergeDropId = ref('')
+
+const mergeUnits = computed(() => stratumState.strata.filter((item) => item.trenchId === mergeTrenchId.value))
+
+/** 实时试算合并结果：可合并则给出预览，否则给出阻止原因 */
+const mergeOutcome = computed(() => {
+  if (!mergeKeepId.value || !mergeDropId.value) return null
+  return planStratumMerge(
+    stratumState.strata,
+    artifactState.artifacts,
+    relationState.relations,
+    mergeKeepId.value,
+    mergeDropId.value
+  )
+})
+
+const mergePlan = computed(() => (mergeOutcome.value?.ok ? mergeOutcome.value.plan : null))
+const mergeBlockers = computed(() => (mergeOutcome.value && !mergeOutcome.value.ok ? mergeOutcome.value.blockers : []))
+
+function pickMergeDefaults(): void {
+  const units = mergeUnits.value
+  if (!units.some((item) => item.id === mergeKeepId.value)) mergeKeepId.value = units[0]?.id ?? ''
+  if (!units.some((item) => item.id === mergeDropId.value) || mergeDropId.value === mergeKeepId.value) {
+    mergeDropId.value = units.find((item) => item.id !== mergeKeepId.value)?.id ?? ''
+  }
+}
+
+function openMerge(): void {
+  // 勾选恰好两个同一探方的单位时直接带入，否则按当前筛选探方给出默认选择
+  const picked = stratumState.strata.filter((item) => selectedIds.value.includes(item.id))
+  if (picked.length === 2 && picked[0].trenchId === picked[1].trenchId) {
+    mergeTrenchId.value = picked[0].trenchId
+    mergeKeepId.value = picked[0].id
+    mergeDropId.value = picked[1].id
+  } else {
+    mergeTrenchId.value = filterTrenchId.value || trenchState.trenches[0]?.id || ''
+    mergeKeepId.value = ''
+    mergeDropId.value = ''
+    pickMergeDefaults()
+  }
+  mergeVisible.value = true
+}
+
+function onMergeTrenchChange(): void {
+  mergeKeepId.value = ''
+  mergeDropId.value = ''
+  pickMergeDefaults()
+}
+
+watch(mergeKeepId, () => {
+  if (mergeDropId.value && mergeDropId.value === mergeKeepId.value) {
+    mergeDropId.value = mergeUnits.value.find((item) => item.id !== mergeKeepId.value)?.id ?? ''
+  }
+})
+
+function swapMerge(): void {
+  const keep = mergeKeepId.value
+  mergeKeepId.value = mergeDropId.value
+  mergeDropId.value = keep
+}
+
+async function confirmMerge(): Promise<void> {
+  if (!mergeKeepId.value || !mergeDropId.value) {
+    ElMessage.warning('请选择同一探方内的两个地层单位')
+    return
+  }
+  merging.value = true
+  try {
+    const outcome = await stratumStore.getState().merge(mergeKeepId.value, mergeDropId.value)
+    if (!outcome.ok) {
+      ElMessageBox.alert(outcome.blockers.map((item, index) => `${index + 1}. ${item}`).join('；'), '无法合并，两个单位保持原样', {
+        type: 'error',
+        confirmButtonText: '知道了'
+      })
+      return
+    }
+    const { plan } = outcome
+    ElMessage.success(
+      `已将「${plan.drop.code}」并入「${plan.keep.code}」：迁移 ${plan.stats.artifacts} 件出土物、${plan.stats.relations} 条层位关系，归并 ${plan.stats.mergedRelations} 条重复关系`
+    )
+    selectedIds.value = selectedIds.value.filter((id) => id !== plan.drop.id)
+    mergeVisible.value = false
+  } finally {
+    merging.value = false
+  }
+}
 </script>
 
 <template>
@@ -253,6 +347,9 @@ async function applyBatchType(): Promise<void> {
         <el-option v-for="type in UNIT_TYPES" :key="type" :label="type" :value="type" />
       </el-select>
       <el-button type="primary" plain @click="applyBatchType">批量调整类型</el-button>
+      <el-button type="warning" plain @click="openMerge">
+        <el-icon><Connection /></el-icon>合并单位
+      </el-button>
       <el-tag type="info" effect="plain">命中 {{ visible.length }} / {{ stratumState.strata.length }} 个单位</el-tag>
     </div>
 
@@ -392,6 +489,81 @@ async function applyBatchType(): Promise<void> {
         <el-button type="primary" @click="submit">保存</el-button>
       </template>
     </el-dialog>
+
+    <el-dialog v-model="mergeVisible" title="合并地层单位" width="640px">
+      <el-form label-width="110px">
+        <el-form-item label="所属探方" required>
+          <el-select v-model="mergeTrenchId" style="width: 100%" @change="onMergeTrenchChange">
+            <el-option v-for="trench in trenchState.trenches" :key="trench.id" :label="`${trench.area} · ${trench.code}`" :value="trench.id" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="保留单位" required>
+          <el-select v-model="mergeKeepId" filterable style="width: 100%">
+            <el-option
+              v-for="unit in mergeUnits"
+              :key="unit.id"
+              :label="`${unit.code}（${unit.type} · ${unit.topDepth}–${unit.bottomDepth} m）`"
+              :value="unit.id"
+            />
+          </el-select>
+          <p class="merge-hint">保留此单位号与编目信息，编目表、关系图与剖面合并后均按此单位显示</p>
+        </el-form-item>
+        <el-form-item label="并入单位" required>
+          <div class="merge-row">
+            <el-select v-model="mergeDropId" filterable style="width: 100%">
+              <el-option
+                v-for="unit in mergeUnits.filter((unit) => unit.id !== mergeKeepId)"
+                :key="unit.id"
+                :label="`${unit.code}（${unit.type} · ${unit.topDepth}–${unit.bottomDepth} m）`"
+                :value="unit.id"
+              />
+            </el-select>
+            <el-button size="small" :disabled="!mergeKeepId || !mergeDropId" @click="swapMerge">互换</el-button>
+          </div>
+          <p class="merge-hint">并入单位在合并后删除，其出土物与层位关系全部迁入保留单位</p>
+        </el-form-item>
+      </el-form>
+
+      <el-alert
+        v-if="mergeUnits.length < 2"
+        type="info"
+        :closable="false"
+        show-icon
+        title="该探方不足两个地层单位，无法合并"
+      />
+      <el-alert
+        v-else-if="mergeBlockers.length > 0"
+        type="error"
+        :closable="false"
+        show-icon
+        title="无法合并，两个单位将保持原样"
+      >
+        <template #default>
+          <p v-for="(item, index) in mergeBlockers" :key="index" class="blocker">{{ index + 1 }}. {{ item }}</p>
+        </template>
+      </el-alert>
+      <el-alert
+        v-else-if="mergePlan"
+        type="success"
+        :closable="false"
+        show-icon
+        :title="`将把「${mergePlan.drop.code}」并入「${mergePlan.keep.code}」`"
+      >
+        <template #default>
+          <p class="blocker">
+            迁移 {{ mergePlan.stats.artifacts }} 件出土物、{{ mergePlan.stats.relations }} 条层位关系；归并
+            {{ mergePlan.stats.mergedRelations }} 条重复关系。合并后「{{ mergePlan.drop.code }}」从编目表删除，编号「{{
+              mergePlan.keep.code
+            }}」保留。
+          </p>
+        </template>
+      </el-alert>
+
+      <template #footer>
+        <el-button @click="mergeVisible = false">取消</el-button>
+        <el-button type="primary" :disabled="!mergePlan" :loading="merging" @click="confirmMerge">确认合并</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -411,5 +583,22 @@ async function applyBatchType(): Promise<void> {
   margin: 0;
   color: #c0392b;
   font-size: 12px;
+}
+.merge-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+.merge-hint {
+  margin: 4px 0 0;
+  font-size: 12px;
+  color: #8a5a2b;
+  line-height: 1.5;
+}
+.blocker {
+  margin: 2px 0;
+  font-size: 12px;
+  line-height: 1.6;
 }
 </style>
